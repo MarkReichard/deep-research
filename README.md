@@ -1,10 +1,17 @@
+# About this fork
+This is my learning fork of [X/Twitter](https://x.com/dzhng)'s very cool open source implementation of Deep Research.
+
+I added comments and slightly refactored the code to make it easier for me to follow while at the same time much more verbose.
+
+The base repo is here https://github.com/dzhng/deep-research 
+
 # Open Deep Research
 
 An AI-powered research assistant that performs iterative, deep research on any topic by combining search engines, web scraping, and large language models.
 
 The goal of this repo is to provide the simplest implementation of a deep research agent - e.g. an agent that can refine its research direction overtime and deep dive into a topic. Goal is to keep the repo size at <500 LoC so it is easy to understand and build on top of.
 
-If you like this project, please consider starring it and giving me a follow on [X/Twitter](https://x.com/dzhng). This project is sponsored by [Aomni](https://aomni.com).
+If you like this project, please consider starring it and giving David a follow on [X/Twitter](https://x.com/dzhng). This project is sponsored by [Aomni](https://aomni.com).
 
 ## How It Works
 
