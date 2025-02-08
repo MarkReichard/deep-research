@@ -1,5 +1,5 @@
 # About this fork
-This is my learning fork of [David Zhang's](https://x.com/dzhng)'s very cool open source implementation of Deep Research.
+This is my learning fork of [David Zhang's](https://x.com/dzhng) very cool open source implementation of Deep Research.
 
 I added comments and slightly refactored the code to make it easier for me to follow while at the same time much more verbose.
 
