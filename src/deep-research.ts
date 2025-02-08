@@ -2,174 +2,230 @@ import FirecrawlApp, { SearchResponse } from '@mendable/firecrawl-js';
 import { generateObject } from 'ai';
 import { compact } from 'lodash-es';
 import pLimit from 'p-limit';
-import { o3MiniModel, trimPrompt } from './ai/providers';
-import { z as zodSchemaValidation } from 'zod'; // Renamed 'z' to 'zodSchema' for clarity
-import { basePromptToAiModel } from './prompt';
+import { aiModelToUse } from './ai/providers';
+import { z as zodSchemaValidation } from 'zod';
+import { 
+  basePromptToAiModel, 
+  generateSerpPromptWithLearnings, 
+  generateSerpAnalysisPrompt, 
+  trimPrompt, 
+  finalReportPrompt 
+} from './prompt';
+import { generateSerpSchema, generateSerpAnalysisSchema } from './schema';
 
+// --------------------
+// Type Definitions
+// --------------------
+
+/** Parameters for initiating deep research */
+type DeepResearchParams = {
+  query: string;
+  breadth: number;
+  depth: number;
+  learnings?: string[];
+  visitedUrls?: string[];
+};
+
+/** Final research results: accumulated learnings and visited URLs */
 type ResearchResult = {
   learnings: string[];
   visitedUrls: string[];
 };
 
-// increase this if you have higher API rate limits
+/** A single SERP query with its associated research goal */
+type SerpQuery = {
+  query: string;
+  researchGoal: string;
+};
+
+/** Parameters for generating SERP queries */
+type GenerateSerpQueriesParams = {
+  query: string;
+  numQueries?: number;
+  learnings?: string[];
+};
+
+/** Parameters for processing SERP results */
+type ProcessSerpResultParams = {
+  query: string;
+  result: SearchResponse;
+  numLearnings?: number;
+  numFollowUpQuestions?: number;
+};
+
+/** Structure of the AI-generated SERP analysis result */
+type SerpAnalysisResult = {
+  learnings: string[];
+  followUpQuestions: string[];
+};
+
+// Increase this if you have higher API rate limits
 const ConcurrencyLimit = 2;
 
-// Initialize Firecrawl with optional API key and optional base url
+// Initialize Firecrawl with optional API key and base URL
 const firecrawl = new FirecrawlApp({
   apiKey: process.env.FIRECRAWL_KEY ?? '',
   apiUrl: process.env.FIRECRAWL_BASE_URL,
 });
 
+// --------------------
+// Helper Functions
+// --------------------
 
 /**
- * Generates a SERP (Search Engine Results Page) query prompt for AI-based research generation.
+ * Fetch SERP results for a given query.
  *
- * This function constructs a structured prompt to guide an AI model in generating a list of search queries
- * based on a user-provided topic. If prior research learnings are available, they are appended to refine
- * and improve the specificity of the generated queries.
- *
- * @param {string} query - The main research query provided by the user.
- * @param {number} numQueries - The maximum number of search queries to generate.
- * @param {string[]} [learnings] - (Optional) A list of insights from previous research to guide query generation.
- * @returns {string} - A well-formatted prompt string to be passed to an AI model.
- *
- * @example
- * // Basic usage without learnings
- * const prompt = generateSerpPromptWithLearnings("Effects of AI on healthcare", 5);
- * console.log(prompt);
- *
- * // Usage with learnings
- * const promptWithLearnings = generateSerpPromptWithLearnings("Effects of AI on healthcare", 5, [
- *   "AI assists in early disease detection.",
- *   "Machine learning improves patient diagnostics."
- * ]);
- * console.log(promptWithLearnings);
+ * @param query - The query string to search.
+ * @returns A promise resolving to the SearchResponse.
  */
-const generateSerpPromptWithLearnings = (query: string, numQueries: number, learnings?: string[]): string => {
-  // Base prompt structure
-  let prompt = `Given the following prompt from the user, generate a list of SERP queries to research the topic.
-Return a maximum of ${numQueries} queries, but feel free to return less if the original prompt is clear.
-Make sure each query is unique and not similar to each other:
-<prompt>${query}</prompt>`;
+const fetchSerpResults = async (query: string): Promise<SearchResponse> => {
+  return await firecrawl.search(query, {
+    timeout: 15000,
+    limit: 5,
+    scrapeOptions: { formats: ['markdown'] },
+  });
+};
 
-  // Append learnings only if provided
-  if (learnings && learnings.length > 0) {
-    prompt += `\n\nHere are some learnings from previous research, use them to generate more specific queries:\n${learnings.join('\n')}`;
+/**
+ * Extracts URLs from the SERP search result.
+ *
+ * @param result - The SearchResponse containing data.
+ * @returns An array of URLs.
+ */
+const extractUrlsFromResult = (result: SearchResponse): string[] => {
+  return compact(result.data.map(item => item.url));
+};
+
+/**
+ * Generates the next research query by combining the previous research goal and follow-up questions.
+ *
+ * @param researchGoal - The previous research goal.
+ * @param followUpQuestions - The list of follow-up questions.
+ * @returns The next query string.
+ */
+const generateNextResearchQuery = (researchGoal: string, followUpQuestions: string[]): string => {
+  // Join follow-up questions without extra spaces.
+  const followUps = followUpQuestions.map(q => q.trim()).join('\n');
+  return `Previous research goal: ${researchGoal}\nFollow-up research directions: ${followUps}`;
+};
+
+/**
+ * Logs errors encountered while processing a SERP query.
+ *
+ * @param error - The error object.
+ * @param query - The query string that caused the error.
+ */
+const handleSerpQueryError = (error: any, query: string): void => {
+  if (error.message && error.message.includes("Timeout")) {
+    console.error(`Timeout error running query: ${query}:`, error);
+  } else {
+    console.error(`Error running query: ${query}:`, error);
   }
-
-  return prompt;
 };
-
-
 
 /**
- * Generates a Zod schema to validate the structure of SERP (Search Engine Results Page) queries.
+ * Generates SERP queries using the provided prompt and schema.
  *
- * This schema ensures that:
- * - The input is an object containing a `queries` field.
- * - The `queries` field is an array of objects.
- * - Each object in the array contains:
- *   - A `query` field (string) representing the actual search query.
- *   - A `researchGoal` field (string) that describes the intent and next steps for research.
- *
- * @param {number} numQueries - The maximum number of queries allowed in the array.
- * @returns {zod.ZodObject} - A Zod validation schema for validating SERP query results.
+ * @param params - Parameters including the query and learnings.
+ * @returns An array of SERP queries.
  */
-const generateSerpSchema = (numQueries: number) => {
-  return zodSchemaValidation.object({
-    // The outer object must contain a `queries` field
-    queries: zodSchemaValidation
-      .array(
-        // The `queries` field must be an array of objects
-        zodSchemaValidation.object({
-          // Each object in the array must have a `query` field
-          query: zodSchemaValidation.string().describe(
-            'The SERP query' // A simple search query string
-          ),
-
-          // Each object must also have a `researchGoal` field
-          researchGoal: zodSchemaValidation
-            .string()
-            .describe(
-              `First talk about the goal of the research that this query is meant to accomplish, 
-              then go deeper into how to advance the research once the results are found, 
-              mention additional research directions. Be as specific as possible, 
-              especially for additional research directions.` // Descriptive metadata about the research goal
-            ),
-        })
-      )
-      .describe(`List of SERP queries, max of ${numQueries}`), // Limit the number of queries
+async function generateSerpQueries(params: GenerateSerpQueriesParams): Promise<SerpQuery[]> {
+  const queryResult = await generateObject({
+    model: aiModelToUse,
+    system: basePromptToAiModel(),
+    prompt: generateSerpPromptWithLearnings(params.query, params.numQueries ?? 3, params.learnings),
+    schema: generateSerpSchema(params.numQueries ?? 3),
   });
+  console.log(`Created ${queryResult.object.queries.length} queries`, queryResult.object.queries);
+  return queryResult.object.queries.slice(0, params.numQueries ?? 3);
+}
+
+/**
+ * Extracts and trims markdown content from a SERP result.
+ *
+ * @param result - The SERP search response.
+ * @returns A list of trimmed markdown content strings.
+ */
+const extractAndTrimSerpContent = (result: SearchResponse): string[] => {
+  return compact(result.data.map(item => item.markdown))
+    .map(content => trimPrompt(content, 25000)); // 25_000 is the same as 25000
 };
 
-// take end user query, return a list of search engine queries
-async function generateSerpQueries({
-  query,
-  numQueries = 3,
-  learnings,
-}: {
-  query: string;
-  numQueries?: number;
-  // optional, if provided, the research will continue from the last learning
-  learnings?: string[];
-}) {
-  //call the model to 
-  const res = await generateObject({
-    model: o3MiniModel,
-    system: basePromptToAiModel(),
-    prompt: generateSerpPromptWithLearnings(query, numQueries, learnings),
-    schema: generateSerpSchema(numQueries),
-  });
-  console.log(
-    `Created ${res.object.queries.length} queries`,
-    res.object.queries,
-  );
+/**
+ * Processes a SERP result by generating a prompt, invoking the AI model, and returning analysis.
+ *
+ * @param params - Parameters including query, result, and optional counts.
+ * @returns A promise resolving to the SERP analysis result.
+ */
+const processSerpResult = async (params: ProcessSerpResultParams): Promise<SerpAnalysisResult> => {
+  const contents = extractAndTrimSerpContent(params.result);
+  console.log(`Ran ${params.query}, found ${contents.length} contents`);
 
-  return res.object.queries.slice(0, numQueries);
-}
-
-async function processSerpResult({
-  query,
-  result,
-  numLearnings = 3,
-  numFollowUpQuestions = 3,
-}: {
-  query: string;
-  result: SearchResponse;
-  numLearnings?: number;
-  numFollowUpQuestions?: number;
-}) {
-  const contents = compact(result.data.map(item => item.markdown)).map(
-    content => trimPrompt(content, 25_000),
-  );
-  console.log(`Ran ${query}, found ${contents.length} contents`);
+  const aiPrompt = generateSerpAnalysisPrompt(params.query, contents, params.numLearnings ?? 3);
+  const aiSchema = generateSerpAnalysisSchema(params.numLearnings ?? 3, params.numFollowUpQuestions ?? 3);
 
   const res = await generateObject({
-    model: o3MiniModel,
-    abortSignal: AbortSignal.timeout(60_000),
+    model: aiModelToUse,
+    abortSignal: AbortSignal.timeout(60000),
     system: basePromptToAiModel(),
-    prompt: `Given the following contents from a SERP search for the query <query>${query}</query>, generate a list of learnings from the contents. Return a maximum of ${numLearnings} learnings, but feel free to return less if the contents are clear. Make sure each learning is unique and not similar to each other. The learnings should be concise and to the point, as detailed and infromation dense as possible. Make sure to include any entities like people, places, companies, products, things, etc in the learnings, as well as any exact metrics, numbers, or dates. The learnings will be used to research the topic further.\n\n<contents>${contents
-      .map(content => `<content>\n${content}\n</content>`)
-      .join('\n')}</contents>`,
-    schema: zodSchemaValidation.object({
-      learnings: zodSchemaValidation
-        .array(zodSchemaValidation.string())
-        .describe(`List of learnings, max of ${numLearnings}`),
-      followUpQuestions: zodSchemaValidation
-        .array(zodSchemaValidation.string())
-        .describe(
-          `List of follow-up questions to research the topic further, max of ${numFollowUpQuestions}`,
-        ),
-    }),
+    prompt: aiPrompt,
+    schema: aiSchema,
   });
-  console.log(
-    `Created ${res.object.learnings.length} learnings`,
-    res.object.learnings,
-  );
-
+  console.log(`Created ${res.object.learnings.length} learnings`, res.object.learnings);
   return res.object;
-}
+};
 
+/**
+ * Processes a single SERP query: executes search, extracts learnings, and recurses if needed.
+ *
+ * @param serpQuery - A single SERP query to process.
+ * @param breadth - The current breadth value.
+ * @param depth - The current depth for recursion.
+ * @param learnings - Accumulated learnings so far.
+ * @param visitedUrls - Accumulated visited URLs so far.
+ * @returns A promise resolving to the research result.
+ */
+const processSingleSerpQuery = async (
+  serpQuery: SerpQuery,
+  breadth: number,
+  depth: number,
+  learnings: string[],
+  visitedUrls: string[]
+): Promise<ResearchResult> => {
+  try {
+    const result = await fetchSerpResults(serpQuery.query);
+    const newUrls = extractUrlsFromResult(result);
+    const newBreadth = Math.ceil(breadth / 2);
+    const newDepth = depth - 1;
+
+    const newLearnings = await processSerpResult({
+      query: serpQuery.query,
+      result,
+      numFollowUpQuestions: newBreadth,
+    });
+
+    const allLearnings = [...learnings, ...newLearnings.learnings];
+    const allUrls = [...visitedUrls, ...newUrls];
+
+    // Recurse if depth allows
+    if (newDepth > 0) {
+      console.log(`Researching deeper, breadth: ${newBreadth}, depth: ${newDepth}`);
+      const nextQuery = generateNextResearchQuery(serpQuery.researchGoal, newLearnings.followUpQuestions);
+      return await deepResearch({ query: nextQuery, breadth: newBreadth, depth: newDepth, learnings: allLearnings, visitedUrls: allUrls });
+    }
+    return { learnings: allLearnings, visitedUrls: allUrls };
+  } catch (error: any) {
+    handleSerpQueryError(error, serpQuery.query);
+    return { learnings: [], visitedUrls: [] };
+  }
+};
+
+/**
+ * Generates the next research report based on the user's prompt, learnings, and visited URLs.
+ *
+ * @param params - An object containing the user's prompt, learnings, and visited URLs.
+ * @returns A promise that resolves to the final report as a Markdown string.
+ */
 export async function writeFinalReport({
   prompt,
   learnings,
@@ -178,112 +234,41 @@ export async function writeFinalReport({
   prompt: string;
   learnings: string[];
   visitedUrls: string[];
-}) {
+}): Promise<string> {
+  // Format learnings into XML-like tags and trim if necessary
   const learningsString = trimPrompt(
-    learnings
-      .map(learning => `<learning>\n${learning}\n</learning>`)
-      .join('\n'),
-    150_000,
+    learnings.map(learning => `<learning>\n${learning}\n</learning>`).join('\n'),
+    150000
   );
 
-  const res = await generateObject({
-    model: o3MiniModel,
+  const finalReportResult = await generateObject({
+    model: aiModelToUse,
     system: basePromptToAiModel(),
-    prompt: `Given the following prompt from the user, write a final report on the topic using the learnings from research. Make it as as detailed as possible, aim for 3 or more pages, include ALL the learnings from research:\n\n<prompt>${prompt}</prompt>\n\nHere are all the learnings from previous research:\n\n<learnings>\n${learningsString}\n</learnings>`,
+    prompt: finalReportPrompt(prompt, learningsString),
     schema: zodSchemaValidation.object({
-      reportMarkdown: zodSchemaValidation
-        .string()
-        .describe('Final report on the topic in Markdown'),
+      reportMarkdown: zodSchemaValidation.string().describe('Final report on the topic in Markdown'),
     }),
   });
 
-  // Append the visited URLs section to the report
   const urlsSection = `\n\n## Sources\n\n${visitedUrls.map(url => `- ${url}`).join('\n')}`;
-  return res.object.reportMarkdown + urlsSection;
+  return finalReportResult.object.reportMarkdown + urlsSection;
 }
 
-export async function deepResearch({
-  query,
-  breadth,
-  depth,
-  learnings = [],
-  visitedUrls = [],
-}: {
-  query: string;
-  breadth: number;
-  depth: number;
-  learnings?: string[];
-  visitedUrls?: string[];
-}): Promise<ResearchResult> {
-  const serpQueries = await generateSerpQueries({
-    query,
-    learnings,
-    numQueries: breadth,
-  });
+/**
+ * Conducts deep research by recursively generating SERP queries and processing their results.
+ *
+ * @param params - The deep research parameters.
+ * @returns A promise resolving to the final research result.
+ */
+export async function deepResearch(params: DeepResearchParams): Promise<ResearchResult> {
+  const { query, breadth, depth, learnings = [], visitedUrls = [] } = params;
+  const serpQueries = await generateSerpQueries({ query, learnings, numQueries: breadth });
+  
   const limit = pLimit(ConcurrencyLimit);
-
   const results = await Promise.all(
     serpQueries.map(serpQuery =>
-      limit(async () => {
-        try {
-          const result = await firecrawl.search(serpQuery.query, {
-            timeout: 15000,
-            limit: 5,
-            scrapeOptions: { formats: ['markdown'] },
-          });
-
-          // Collect URLs from this search
-          const newUrls = compact(result.data.map(item => item.url));
-          const newBreadth = Math.ceil(breadth / 2);
-          const newDepth = depth - 1;
-
-          const newLearnings = await processSerpResult({
-            query: serpQuery.query,
-            result,
-            numFollowUpQuestions: newBreadth,
-          });
-          const allLearnings = [...learnings, ...newLearnings.learnings];
-          const allUrls = [...visitedUrls, ...newUrls];
-
-          if (newDepth > 0) {
-            console.log(
-              `Researching deeper, breadth: ${newBreadth}, depth: ${newDepth}`,
-            );
-
-            const nextQuery = `
-            Previous research goal: ${serpQuery.researchGoal}
-            Follow-up research directions: ${newLearnings.followUpQuestions.map(q => `\n${q}`).join('')}
-          `.trim();
-
-            return deepResearch({
-              query: nextQuery,
-              breadth: newBreadth,
-              depth: newDepth,
-              learnings: allLearnings,
-              visitedUrls: allUrls,
-            });
-          } else {
-            return {
-              learnings: allLearnings,
-              visitedUrls: allUrls,
-            };
-          }
-        } catch (e: any) {
-          if (e.message && e.message.includes('Timeout')) {
-            console.error(
-              `Timeout error running query: ${serpQuery.query}: `,
-              e,
-            );
-          } else {
-            console.error(`Error running query: ${serpQuery.query}: `, e);
-          }
-          return {
-            learnings: [],
-            visitedUrls: [],
-          };
-        }
-      }),
-    ),
+      limit(() => processSingleSerpQuery(serpQuery, breadth, depth, learnings, visitedUrls))
+    )
   );
 
   return {
