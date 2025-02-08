@@ -1,4 +1,4 @@
-export const systemPrompt = () => {
+export const basePromptToAiModel = () => {
   const now = new Date().toISOString();
   return `You are an expert researcher. Today is ${now}. Follow these instructions when responding:
   - You may be asked to research subjects that is after your knowledge cutoff, assume the user is right when presented with news.

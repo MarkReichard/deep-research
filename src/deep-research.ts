@@ -2,10 +2,9 @@ import FirecrawlApp, { SearchResponse } from '@mendable/firecrawl-js';
 import { generateObject } from 'ai';
 import { compact } from 'lodash-es';
 import pLimit from 'p-limit';
-import { z } from 'zod';
-
 import { o3MiniModel, trimPrompt } from './ai/providers';
-import { systemPrompt } from './prompt';
+import { z as zodSchemaValidation } from 'zod'; // Renamed 'z' to 'zodSchema' for clarity
+import { basePromptToAiModel } from './prompt';
 
 type ResearchResult = {
   learnings: string[];
@@ -16,13 +15,94 @@ type ResearchResult = {
 const ConcurrencyLimit = 2;
 
 // Initialize Firecrawl with optional API key and optional base url
-
 const firecrawl = new FirecrawlApp({
   apiKey: process.env.FIRECRAWL_KEY ?? '',
   apiUrl: process.env.FIRECRAWL_BASE_URL,
 });
 
-// take en user query, return a list of SERP queries
+
+/**
+ * Generates a SERP (Search Engine Results Page) query prompt for AI-based research generation.
+ *
+ * This function constructs a structured prompt to guide an AI model in generating a list of search queries
+ * based on a user-provided topic. If prior research learnings are available, they are appended to refine
+ * and improve the specificity of the generated queries.
+ *
+ * @param {string} query - The main research query provided by the user.
+ * @param {number} numQueries - The maximum number of search queries to generate.
+ * @param {string[]} [learnings] - (Optional) A list of insights from previous research to guide query generation.
+ * @returns {string} - A well-formatted prompt string to be passed to an AI model.
+ *
+ * @example
+ * // Basic usage without learnings
+ * const prompt = generateSerpPromptWithLearnings("Effects of AI on healthcare", 5);
+ * console.log(prompt);
+ *
+ * // Usage with learnings
+ * const promptWithLearnings = generateSerpPromptWithLearnings("Effects of AI on healthcare", 5, [
+ *   "AI assists in early disease detection.",
+ *   "Machine learning improves patient diagnostics."
+ * ]);
+ * console.log(promptWithLearnings);
+ */
+const generateSerpPromptWithLearnings = (query: string, numQueries: number, learnings?: string[]): string => {
+  // Base prompt structure
+  let prompt = `Given the following prompt from the user, generate a list of SERP queries to research the topic.
+Return a maximum of ${numQueries} queries, but feel free to return less if the original prompt is clear.
+Make sure each query is unique and not similar to each other:
+<prompt>${query}</prompt>`;
+
+  // Append learnings only if provided
+  if (learnings && learnings.length > 0) {
+    prompt += `\n\nHere are some learnings from previous research, use them to generate more specific queries:\n${learnings.join('\n')}`;
+  }
+
+  return prompt;
+};
+
+
+
+/**
+ * Generates a Zod schema to validate the structure of SERP (Search Engine Results Page) queries.
+ *
+ * This schema ensures that:
+ * - The input is an object containing a `queries` field.
+ * - The `queries` field is an array of objects.
+ * - Each object in the array contains:
+ *   - A `query` field (string) representing the actual search query.
+ *   - A `researchGoal` field (string) that describes the intent and next steps for research.
+ *
+ * @param {number} numQueries - The maximum number of queries allowed in the array.
+ * @returns {zod.ZodObject} - A Zod validation schema for validating SERP query results.
+ */
+const generateSerpSchema = (numQueries: number) => {
+  return zodSchemaValidation.object({
+    // The outer object must contain a `queries` field
+    queries: zodSchemaValidation
+      .array(
+        // The `queries` field must be an array of objects
+        zodSchemaValidation.object({
+          // Each object in the array must have a `query` field
+          query: zodSchemaValidation.string().describe(
+            'The SERP query' // A simple search query string
+          ),
+
+          // Each object must also have a `researchGoal` field
+          researchGoal: zodSchemaValidation
+            .string()
+            .describe(
+              `First talk about the goal of the research that this query is meant to accomplish, 
+              then go deeper into how to advance the research once the results are found, 
+              mention additional research directions. Be as specific as possible, 
+              especially for additional research directions.` // Descriptive metadata about the research goal
+            ),
+        })
+      )
+      .describe(`List of SERP queries, max of ${numQueries}`), // Limit the number of queries
+  });
+};
+
+// take end user query, return a list of search engine queries
 async function generateSerpQueries({
   query,
   numQueries = 3,
@@ -30,34 +110,15 @@ async function generateSerpQueries({
 }: {
   query: string;
   numQueries?: number;
-
   // optional, if provided, the research will continue from the last learning
   learnings?: string[];
 }) {
+  //call the model to 
   const res = await generateObject({
     model: o3MiniModel,
-    system: systemPrompt(),
-    prompt: `Given the following prompt from the user, generate a list of SERP queries to research the topic. Return a maximum of ${numQueries} queries, but feel free to return less if the original prompt is clear. Make sure each query is unique and not similar to each other: <prompt>${query}</prompt>\n\n${
-      learnings
-        ? `Here are some learnings from previous research, use them to generate more specific queries: ${learnings.join(
-            '\n',
-          )}`
-        : ''
-    }`,
-    schema: z.object({
-      queries: z
-        .array(
-          z.object({
-            query: z.string().describe('The SERP query'),
-            researchGoal: z
-              .string()
-              .describe(
-                'First talk about the goal of the research that this query is meant to accomplish, then go deeper into how to advance the research once the results are found, mention additional research directions. Be as specific as possible, especially for additional research directions.',
-              ),
-          }),
-        )
-        .describe(`List of SERP queries, max of ${numQueries}`),
-    }),
+    system: basePromptToAiModel(),
+    prompt: generateSerpPromptWithLearnings(query, numQueries, learnings),
+    schema: generateSerpSchema(numQueries),
   });
   console.log(
     `Created ${res.object.queries.length} queries`,
@@ -86,16 +147,16 @@ async function processSerpResult({
   const res = await generateObject({
     model: o3MiniModel,
     abortSignal: AbortSignal.timeout(60_000),
-    system: systemPrompt(),
+    system: basePromptToAiModel(),
     prompt: `Given the following contents from a SERP search for the query <query>${query}</query>, generate a list of learnings from the contents. Return a maximum of ${numLearnings} learnings, but feel free to return less if the contents are clear. Make sure each learning is unique and not similar to each other. The learnings should be concise and to the point, as detailed and infromation dense as possible. Make sure to include any entities like people, places, companies, products, things, etc in the learnings, as well as any exact metrics, numbers, or dates. The learnings will be used to research the topic further.\n\n<contents>${contents
       .map(content => `<content>\n${content}\n</content>`)
       .join('\n')}</contents>`,
-    schema: z.object({
-      learnings: z
-        .array(z.string())
+    schema: zodSchemaValidation.object({
+      learnings: zodSchemaValidation
+        .array(zodSchemaValidation.string())
         .describe(`List of learnings, max of ${numLearnings}`),
-      followUpQuestions: z
-        .array(z.string())
+      followUpQuestions: zodSchemaValidation
+        .array(zodSchemaValidation.string())
         .describe(
           `List of follow-up questions to research the topic further, max of ${numFollowUpQuestions}`,
         ),
@@ -127,10 +188,10 @@ export async function writeFinalReport({
 
   const res = await generateObject({
     model: o3MiniModel,
-    system: systemPrompt(),
+    system: basePromptToAiModel(),
     prompt: `Given the following prompt from the user, write a final report on the topic using the learnings from research. Make it as as detailed as possible, aim for 3 or more pages, include ALL the learnings from research:\n\n<prompt>${prompt}</prompt>\n\nHere are all the learnings from previous research:\n\n<learnings>\n${learningsString}\n</learnings>`,
-    schema: z.object({
-      reportMarkdown: z
+    schema: zodSchemaValidation.object({
+      reportMarkdown: zodSchemaValidation
         .string()
         .describe('Final report on the topic in Markdown'),
     }),
