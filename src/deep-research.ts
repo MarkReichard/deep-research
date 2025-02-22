@@ -60,7 +60,11 @@ type SerpAnalysisResult = {
 };
 
 // Increase this if you have higher API rate limits
-const ConcurrencyLimit = 2;
+const ConcurrencyLimit = 1;
+// Define a rate limit in milliseconds (adjust as needed based on API documentation)
+const RATE_LIMIT_MS = 1000; // Example: 1 request per second
+
+
 
 // Initialize Firecrawl with optional API key and base URL
 const firecrawl = new FirecrawlApp({
@@ -71,14 +75,16 @@ const firecrawl = new FirecrawlApp({
 // --------------------
 // Helper Functions
 // --------------------
-
+// Sleep function to introduce a delay
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 /**
- * Fetch SERP results for a given query.
+ * Fetch SERP results for a given query with rate limiting.
  *
  * @param query - The query string to search.
  * @returns A promise resolving to the SearchResponse.
  */
 const fetchSerpResults = async (query: string): Promise<SearchResponse> => {
+  await sleep(RATE_LIMIT_MS); // Enforce rate limit before making a request
   return await firecrawl.search(query, {
     timeout: 15000,
     limit: 5,
